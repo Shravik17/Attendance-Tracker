@@ -4,9 +4,82 @@ from datetime import datetime, date
 import calendar
 import io
 import csv
+import os
 
 app = Flask(__name__)
 app.secret_key = 'your_secret_key_here'
+
+# =================== Persistent "Database" using CSV ========================
+
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+STUDENTS_FILE = os.path.join(DATA_DIR, "students.csv")
+ATTENDANCE_FILE = os.path.join(DATA_DIR, "attendance.csv")
+
+def ensure_data_dir():
+    if not os.path.exists(DATA_DIR):
+        os.makedirs(DATA_DIR)
+    # Ensure files exist, create with header if missing
+    if not os.path.exists(STUDENTS_FILE):
+        with open(STUDENTS_FILE, 'w', encoding='utf-8', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['id', 'name'])
+    if not os.path.exists(ATTENDANCE_FILE):
+        with open(ATTENDANCE_FILE, 'w', encoding='utf-8', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['date', 'student_id', 'present'])
+
+def load_students():
+    lst = []
+    max_id = 0
+    if os.path.exists(STUDENTS_FILE):
+        with open(STUDENTS_FILE, 'r', encoding='utf-8', newline='') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                try:
+                    sid = int(row['id'])
+                    name = row['name']
+                    lst.append({"id": sid, "name": name})
+                    if sid > max_id: max_id = sid
+                except Exception:
+                    continue
+    return lst, max_id+1 if max_id else 1
+
+def save_students(students):
+    with open(STUDENTS_FILE, 'w', encoding='utf-8', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['id', 'name'])
+        for s in students:
+            writer.writerow([s["id"], s["name"]])
+
+def load_attendance():
+    att = {}
+    if os.path.exists(ATTENDANCE_FILE):
+        with open(ATTENDANCE_FILE, 'r', encoding='utf-8', newline='') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                day = row['date']
+                try:
+                    sid = int(row['student_id'])
+                    present = int(row['present'])
+                except Exception:
+                    continue
+                if day not in att:
+                    att[day] = {}
+                att[day][sid] = present
+    return att
+
+def save_attendance(attendance):
+    with open(ATTENDANCE_FILE, 'w', encoding='utf-8', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['date', 'student_id', 'present'])
+        for d, student_map in attendance.items():
+            for sid, pres in student_map.items():
+                writer.writerow([d, sid, pres])
+
+# Guarantee data folder and files exist and load data at startup
+ensure_data_dir()
+students, next_student_id = load_students()
+attendance = load_attendance()
 
 # ------------------- In-memory "Database" ----------------------
 
@@ -26,19 +99,13 @@ users = {
 }
 next_user_id = 3
 
-students = []
-next_student_id = 1
-
-# Attendance: {date: {student_id: present(0/1)}}
-attendance = {}
-
 # ------------------- Utility Functions ----------------------
 
 def get_all_students():
     return [(student["id"], student["name"]) for student in students]
 
-def get_attendance_for_day(date):
-    return attendance.get(date, {}).copy()
+def get_attendance_for_day(thedate):
+    return attendance.get(thedate, {}).copy()
 
 def get_attendance_percentages():
     percentages = []
@@ -93,6 +160,7 @@ def logout():
 
 @app.route('/faculty', methods=['GET', 'POST'])
 def faculty_dashboard():
+    global attendance
     if 'role' not in session or session['role'] != 'faculty':
         return redirect(url_for('login'))
 
@@ -120,6 +188,7 @@ def faculty_dashboard():
             present = 1 if request.form.get(f'present_{sid}') == 'on' else 0
             new_attendance[sid] = present
         attendance[selected_date] = new_attendance
+        save_attendance(attendance) # Write to file whenever submitted!
         attendance_map = get_attendance_for_day(selected_date)
         all_dates = sorted(attendance.keys())
 
@@ -225,21 +294,22 @@ def admin_dashboard():
         return redirect(url_for('login'))
     students_list = get_all_students()
     return render_template('admin_dashboard.html', students=students_list)
-#here lay the tears of a college student
+
 @app.route('/admin/add_student', methods=['POST'])
 def add_student():
-    global next_student_id
+    global next_student_id, students
     if 'role' not in session or session['role'] != 'admin':
         return redirect(url_for('login'))
     name = request.form['student_name'].strip()
     if name:
         students.append({"id": next_student_id, "name": name})
         next_student_id += 1
+        save_students(students)
     return redirect(url_for('admin_dashboard'))
 
 @app.route('/admin/import_students', methods=['POST'])
 def import_students():
-    global next_student_id
+    global next_student_id, students
     if 'role' not in session or session['role'] != 'admin':
         flash("Access denied")
         return redirect(url_for('login'))
@@ -255,7 +325,6 @@ def import_students():
             reader = csv.reader(f)
             csv_rows = list(reader)
             
-            # (Import logic abbreviated for brevity - identical to original)
             header_row = None
             if csv_rows and (csv_rows[0][0].strip().lower() == 'id' or (len(csv_rows[0]) > 1 and csv_rows[0][1].strip().lower() == 'name')):
                 header_row = [col.strip().lower() for col in csv_rows[0]]
@@ -299,6 +368,7 @@ def import_students():
                         next_student_id += 1
                         added += 1
                         existing_names.add(name_field)
+            save_students(students)
             flash(f"Imported {added} students.")
         except Exception:
             flash("Error processing CSV.")
@@ -308,13 +378,16 @@ def import_students():
 
 @app.route('/admin/delete_student/<int:student_id>', methods=['POST'])
 def delete_student(student_id):
+    global students
     if 'role' not in session or session['role'] != 'admin':
         return redirect(url_for('login'))
-    global students
     students[:] = [s for s in students if s["id"] != student_id]
-    for adate in attendance.keys():
+    # Remove attendance records for the deleted student
+    for adate in list(attendance.keys()):
         if student_id in attendance[adate]:
             del attendance[adate][student_id]
+    save_students(students)
+    save_attendance(attendance)
     return redirect(url_for('admin_dashboard'))
 
 @app.route('/student_view', methods=['GET'])
@@ -420,4 +493,8 @@ def get_calendar_context(student_id, year_arg, month_arg):
     }
 
 if __name__ == '__main__':
+    ensure_data_dir()
+    # Reload all data once more in case another process changed files between import and run
+    students, next_student_id = load_students()
+    attendance = load_attendance()
     app.run(host='::', port=80, debug=True)
